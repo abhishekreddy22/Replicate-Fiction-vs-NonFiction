@@ -25,17 +25,27 @@ Table 5 — % of BNC Baby news (97 docs) classified as non-fiction
   under 4 training conditions × 3 feature sets (19, 6, 2).
 """
 
+import os
 import warnings
 # Suppress sklearn 1.8 deprecation of penalty= kwarg.
 warnings.filterwarnings('ignore', message='.*penalty.*deprecated.*', category=FutureWarning)
 warnings.filterwarnings('ignore', message='.*penalty.*deprecated.*', category=UserWarning)
 warnings.filterwarnings('ignore', message='.*Inconsistent values.*penalty.*', category=UserWarning)
+import joblib
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — safe for script execution
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+MODELS_DIR = 'models'
+PLOTS_DIR  = 'plots'
+CLASS_LABELS = ['Non-fiction', 'Fiction']
 
 from feature_selection import (
     NF_CATEGORIES, LOW_LEVEL_FEATURES, ALL_FEATURES, ACTIVE_FEATURES
@@ -103,6 +113,66 @@ def _metrics(y_true, y_pred, majority_class_size, n_total):
     }
 
 
+def _print_confusion_matrix(y_true, y_pred, label=''):
+    """Print a text confusion matrix and save a matplotlib heatmap PNG.
+
+    The PNG is saved to plots/cm_<safe_label>.png.
+    """
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    # ── text output ──────────────────────────────────────────────────────
+    title = f"Confusion Matrix — {label}" if label else "Confusion Matrix"
+    print(f"\n  {title}")
+    print(f"  {'':>20}  Predicted NF  Predicted Fiction")
+    print(f"  {'Actual NF':>20}  {tn:>12}  {fp:>16}")
+    print(f"  {'Actual Fiction':>20}  {fn:>12}  {tp:>16}")
+
+    # ── heatmap ───────────────────────────────────────────────────────────
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    safe = label.replace(' ', '_').replace('—', '-').replace('(', '').replace(')', '').lower()
+    save_path = os.path.join(PLOTS_DIR, f"cm_{safe}.png")
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+
+    # colour bar
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=9)
+
+    # axis labels
+    tick_marks = [0, 1]
+    ax.set_xticks(tick_marks)
+    ax.set_yticks(tick_marks)
+    ax.set_xticklabels(CLASS_LABELS, fontsize=10)
+    ax.set_yticklabels(CLASS_LABELS, fontsize=10)
+    ax.set_xlabel('Predicted label', fontsize=11, labelpad=8)
+    ax.set_ylabel('Actual label', fontsize=11, labelpad=8)
+    ax.set_title(title, fontsize=11, pad=12)
+
+    # count annotations — white text on dark cells, black on light cells
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            color = 'white' if cm[i, j] > thresh else 'black'
+            ax.text(j, i, str(cm[i, j]),
+                    ha='center', va='center',
+                    fontsize=14, fontweight='bold', color=color)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"  Confusion matrix plot saved → {save_path}")
+
+
+def _save_model(model, scaler, filename):
+    """Save model and scaler to the models/ directory using joblib."""
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    path = os.path.join(MODELS_DIR, filename)
+    joblib.dump({'model': model, 'scaler': scaler}, path)
+    print(f"  Model saved → {path}")
+
+
 # ── feature-set definitions ──────────────────────────────────────────────────
 
 def build_feature_sets(six_features, two_features):
@@ -117,9 +187,13 @@ def build_feature_sets(six_features, two_features):
 # ── Setup (a) & (b): 10 × 60/40 splits ─────────────────────────────────────
 
 def _run_repeated_splits(X, y, n_splits=10, test_size=0.4):
-    """Run n_splits random 60/40 stratified splits, return mean ± std metrics."""
+    """Run n_splits random 60/40 stratified splits.
+
+    Returns mean ± std metrics and the model from the last split.
+    """
     results = []
     majority_size = max(np.sum(y == 0), np.sum(y == 1))
+    last_model, last_scaler, last_y_te, last_y_pred = None, None, None, None
 
     for seed in range(n_splits):
         X_tr, X_te, y_tr, y_te = train_test_split(
@@ -134,13 +208,16 @@ def _run_repeated_splits(X, y, n_splits=10, test_size=0.4):
         y_pred = model.predict(X_te_s)
 
         results.append(_metrics(y_te, y_pred, majority_size, len(y)))
+        last_model, last_scaler = model, sc
+        last_y_te, last_y_pred  = y_te, y_pred
 
     keys = ['Accuracy', 'F1_NF', 'F1_F', 'Baseline', 'AccuracyGain']
-    return {
+    stats = {
         k: (np.mean([r[k] for r in results]),
             np.std([r[k]  for r in results]))
         for k in keys
     }
+    return stats, last_model, last_scaler, last_y_te, last_y_pred
 
 
 def setup_a(df_brown, six_features, two_features):
@@ -155,8 +232,12 @@ def setup_a(df_brown, six_features, two_features):
 
     for label, feats in feature_sets.items():
         X = df_brown[feats].values
-        stats = _run_repeated_splits(X, y)
+        stats, model, scaler, y_te, y_pred = _run_repeated_splits(X, y)
         rows.append(_format_row(label, stats))
+        # Confusion matrix uses the last split as a representative sample.
+        _print_confusion_matrix(y_te, y_pred, label=f"Setup (a) — {label}")
+        safe_label = label.replace(' ', '_').lower()
+        _save_model(model, scaler, f"setup_a_{safe_label}.joblib")
 
     _print_table(rows)
     return rows
@@ -182,8 +263,12 @@ def setup_b(df_brown, df_bnc, six_features, two_features):
 
     for label, feats in feature_sets.items():
         X = combined[feats].values
-        stats = _run_repeated_splits(X, y)
+        stats, model, scaler, y_te, y_pred = _run_repeated_splits(X, y)
         rows.append(_format_row(label, stats))
+        # Confusion matrix uses the last split as a representative sample.
+        _print_confusion_matrix(y_te, y_pred, label=f"Setup (b) — {label}")
+        safe_label = label.replace(' ', '_').lower()
+        _save_model(model, scaler, f"setup_b_{safe_label}.joblib")
 
     _print_table(rows)
     return rows
@@ -226,6 +311,9 @@ def setup_c(df_brown_gold, df_brown_ptb, df_bnc, six_features, two_features):
 
         m = _metrics(y_test, y_pred, majority_size, len(y_test))
         rows.append(_format_row_single(label, m))
+        _print_confusion_matrix(y_test, y_pred, label=f"Setup (c) — {label}")
+        safe_label = label.replace(' ', '_').lower()
+        _save_model(model, sc, f"setup_c_{safe_label}.joblib")
 
     _print_table_single(rows)
     return rows
@@ -296,6 +384,11 @@ def table_5(df_brown, df_bnc, df_news, six_features, two_features):
 
             pct_nf = (np.sum(y_pred == 0) / len(y_pred)) * 100
             row_str += f"  {pct_nf:>6.1f}%            "
+
+            # Save model for each training condition and feature set.
+            safe_t = t_label.split(':')[0].strip().lower().replace(' ', '_')
+            safe_f = feat_label.replace(' ', '_').lower()
+            _save_model(model, sc, f"table5_{safe_t}_{safe_f}.joblib")
 
         print(row_str)
 
